@@ -751,12 +751,36 @@ class Recipe:
 
         rendered = self.command.strip()
 
+        # v1 (eugr, .format()-style) recipes escape literal braces as {{ and }}
+        # (e.g. --speculative-config '{{"method":"mtp",...}}').  Mask the escape
+        # sequences before placeholder substitution and restore them as single
+        # braces afterwards, matching the v1 format's str.format() semantics.
+        # Without this, the double braces pass through arg_substitute verbatim
+        # and reach the serve command's argv, where JSON parsing fails.
+        # The mask must tokenize the way str.format scans — one left-to-right
+        # pass where a {field} is consumed before a following }} is treated as
+        # an escape — or an escaped brace directly after a placeholder (e.g.
+        # '{{"p":{port}}}') steals the placeholder's closing brace.
+        is_v1 = self.recipe_version == "1"
+        if is_v1:
+            def _mask_v1_escape(m: "re.Match[str]") -> str:
+                tok = m.group(0)
+                if tok == "{{":
+                    return "\x00SPARKRUN_LBRACE\x00"
+                if tok == "}}":
+                    return "\x00SPARKRUN_RBRACE\x00"
+                return tok  # a {field}: left intact for arg_substitute
+            rendered = re.sub(r"\{\{|\}\}|\{[^{}]*\}", _mask_v1_escape, rendered)
+
         # Use vpd arg_substitute for {placeholder} replacement
         # Iterate to handle nested substitutions
         last = None
         while last != rendered:
             last = rendered
             rendered = arg_substitute(rendered, config_chain)
+
+        if is_v1:
+            rendered = rendered.replace("\x00SPARKRUN_LBRACE\x00", "{").replace("\x00SPARKRUN_RBRACE\x00", "}")
 
         # Fix trailing spaces after backslash line-continuations.
         # ``\<space><newline>`` → ``\<newline>``
