@@ -71,8 +71,7 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run):
     from sparkrun.core.cluster_manager import query_cluster_status
     from sparkrun.orchestration.docker import docker_stop_cmd
     from sparkrun.orchestration.job_metadata import remove_job_metadata
-    from sparkrun.orchestration.primitives import build_ssh_kwargs
-    from sparkrun.orchestration.ssh import run_remote_command
+    from sparkrun.orchestration.primitives import build_ssh_kwargs, run_command_on_host
 
     host_list, _cluster_mgr = _resolve_hosts_or_exit(hosts, hosts_file, cluster_name, config)
 
@@ -103,24 +102,41 @@ def _stop_all(hosts, hosts_file, cluster_name, config, dry_run):
     for entry in result.solo_entries:
         host_containers.setdefault(entry.host, []).append(entry.name)
 
-    # Stop containers per host
+    # Stop containers per host.  Dispatch local-vs-SSH via run_command_on_host
+    # (a bare run_remote_command would try to SSH to localhost, which fails on
+    # hosts without self-SSH configured) and check the result — a failed stop
+    # must not be reported as success.
     click.echo("Stopping all containers...")
     stopped_count = 0
+    failed_hosts: dict[str, str] = {}
     for host, names in host_containers.items():
         cmds = "; ".join(docker_stop_cmd(n) for n in names)
-        run_remote_command(host, cmds, timeout=30, dry_run=dry_run, **ssh_kwargs)
-        stopped_count += len(names)
+        res = run_command_on_host(host, cmds, ssh_kwargs=ssh_kwargs, timeout=30, dry_run=dry_run)
+        if res.success:
+            stopped_count += len(names)
+        else:
+            failed_hosts[host] = (res.stderr or res.stdout).strip() or ("exit code %d" % res.returncode)
 
-    # Clean up job metadata for discovered clusters (skip in dry-run mode)
+    # Clean up job metadata for discovered clusters (skip in dry-run mode and
+    # for any cluster/solo entry with a member on a host where stopping failed
+    # — the container is still running and the metadata still describes it).
     if not dry_run:
-        for cid in result.groups:
+        for cid, group in result.groups.items():
+            if any(member_host in failed_hosts for member_host, _role, _status, _image in group.members):
+                continue
             remove_job_metadata(cid, cache_dir=str(config.cache_dir))
         for entry in result.solo_entries:
+            if entry.host in failed_hosts:
+                continue
             solo_cid = entry.name.removesuffix("_solo") if entry.name.endswith("_solo") else entry.name
             remove_job_metadata(solo_cid, cache_dir=str(config.cache_dir))
 
-    hosts_touched = len(host_containers)
-    click.echo("Stopped %d job(s) across %d host(s)." % (stopped_count, hosts_touched))
+    hosts_touched = len(host_containers) - len(failed_hosts)
+    click.echo("Stopped %d container(s) across %d host(s)." % (stopped_count, hosts_touched))
+    if failed_hosts:
+        for failed_host, err in sorted(failed_hosts.items()):
+            click.echo("Error: failed to stop containers on %s: %s" % (failed_host, err), err=True)
+        sys.exit(1)
 
 
 def _stop_by_cluster_id(target, hosts, hosts_file, cluster_name, config, dry_run):
